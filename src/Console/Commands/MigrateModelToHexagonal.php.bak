@@ -1,0 +1,1667 @@
+<?php
+
+namespace Laymont\HexagonalArchitecture\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Str;
+
+class MigrateModelToHexagonal extends Command
+{
+    protected $signature = 'hexagonal:migrate 
+                            {model? : Nombre del modelo a migrar (ej: User)} 
+                            {--interactive : Ejecutar en modo interactivo} 
+                            {--force : Sobrescribir archivos existentes sin preguntar}
+                            {--discover : Buscar y mostrar modelos Eloquent disponibles}';
+    
+    protected $description = 'Migra un modelo existente a la arquitectura hexagonal';
+    
+    // Configuración predeterminada para el modo interactivo
+    protected bool $isInteractive;
+    protected bool $forceOverwrite;
+
+    public function handle()
+    {
+        // Inicializar configuración
+        $this->isInteractive = $this->option('interactive') || config('hexagonal.cli.interactive', true);
+        $this->forceOverwrite = $this->option('force') || !config('hexagonal.cli.confirm_overwrite', true);
+        
+        // Si la opción de descubrimiento está habilitada, mostrar los modelos disponibles
+        if ($this->option('discover')) {
+            $this->discoverModels();
+            return 0;
+        }
+        
+        // Obtener el modelo a migrar
+        $modelName = $this->argument('model');
+        
+        // Si estamos en modo interactivo y no se especificó un modelo, pedirlo
+        if (!$modelName && $this->isInteractive) {
+            $modelName = $this->askForModel();
+        }
+        
+        // Si todavía no hay modelo, mostrar error
+        if (!$modelName) {
+            $this->error("Debe especificar un modelo para migrar.");
+            return 1;
+        }
+        
+        // Validar que el modelo existe en la configuración
+        if (!config()->has("hexagonal.models." . strtolower($modelName))) {
+            if ($this->isInteractive) {
+                if ($this->confirm("El modelo '{$modelName}' no está configurado. ¿Desea configurarlo ahora?", true)) {
+                    $config = $this->configureModelInteractively($modelName);
+                    // Aquí implementaríamos la lógica para guardar esta configuración
+                    $this->info("Configuración para {$modelName} creada temporalmente para esta ejecución.");
+                } else {
+                    $this->error("Operación cancelada.");
+                    return 1;
+                }
+            } else {
+                $this->error("El modelo '{$modelName}' no está configurado en hexagonal.php");
+                return 1;
+            }
+        } else {
+            $config = config('hexagonal.models.' . strtolower($modelName));
+        }
+        
+        $this->info("Migrando el modelo {$modelName} a arquitectura hexagonal...");
+        
+        try {
+            // Crear directorios si no existen
+            $this->createDirectories();
+            
+            // Generar archivos de dominio
+            $this->generateDomainFiles($modelName, $config);
+            
+            // Generar archivos de aplicación
+            $this->generateApplicationFiles($modelName);
+            
+            // Generar adaptadores de infraestructura
+            $this->generateInfrastructureFiles($modelName, $config);
+            
+            $this->info("{$modelName} ha sido migrado exitosamente a arquitectura hexagonal.");
+            return 0;
+        } catch (\Exception $e) {
+            $this->error("Error al migrar el modelo: {$e->getMessage()}");
+            return 1;
+        }
+    }
+    
+    /**
+     * Descubre automáticamente los modelos Eloquent en la aplicación.
+     */
+    protected function discoverModels(): void
+    {
+        $this->info('Buscando modelos Eloquent disponibles...');
+        
+        $modelsPath = app_path('Models');
+        if (!is_dir($modelsPath)) {
+            $this->warn("El directorio de modelos no existe: {$modelsPath}");
+            return;
+        }
+        
+        $models = [];
+        $files = scandir($modelsPath);
+        
+        foreach ($files as $file) {
+            if ($file === '.' || $file === '..') {
+                continue;
+            }
+            
+            if (pathinfo($file, PATHINFO_EXTENSION) === 'php') {
+                $modelName = pathinfo($file, PATHINFO_FILENAME);
+                $models[] = $modelName;
+            }
+        }
+        
+        if (empty($models)) {
+            $this->info('No se encontraron modelos en ' . $modelsPath);
+            return;
+        }
+        
+        $this->info('Modelos encontrados:');
+        foreach ($models as $model) {
+            $configStatus = config()->has("hexagonal.models." . strtolower($model))
+                ? '<fg=green>Configurado' 
+                : '<fg=yellow>No configurado</>';
+            
+            $this->line("- {$model}: {$configStatus}");
+        }
+        
+        $this->info("\nPara migrar un modelo: php artisan hexagonal:migrate {nombre_modelo} --interactive");
+    }
+    
+    /**
+     * Solicita al usuario que elija un modelo para migrar.
+     */
+    protected function askForModel(): string
+    {
+        $this->info('Seleccione un modelo para migrar a arquitectura hexagonal:');
+        
+        // Obtenemos modelos configurados
+        $configuredModels = array_keys(config('hexagonal.models', []));
+        
+        // Si está habilitado auto-discover, buscamos modelos adicionales
+        if (config('hexagonal.cli.auto_discover_models', true)) {
+            $modelsPath = app_path('Models');
+            if (is_dir($modelsPath)) {
+                $files = scandir($modelsPath);
+                foreach ($files as $file) {
+                    if (pathinfo($file, PATHINFO_EXTENSION) === 'php') {
+                        $model = pathinfo($file, PATHINFO_FILENAME);
+                        if (!in_array(strtolower($model), array_map('strtolower', $configuredModels))) {
+                            $configuredModels[] = $model;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Si no hay modelos, permitir entrada manual
+        if (empty($configuredModels)) {
+            return $this->ask('No se encontraron modelos. Ingrese el nombre de un modelo');
+        }
+        
+        return $this->choice('Seleccione un modelo', $configuredModels);
+    }
+    
+    /**
+     * Configura un modelo interactivamente.
+     */
+    protected function configureModelInteractively(string $modelName): array
+    {
+        $this->info("Configurando el modelo {$modelName}:");
+        
+        $config = [];
+        
+        // Preguntar por el modelo Eloquent
+        $eloquentModel = $this->ask("Clase del modelo Eloquent", "App\\Models\\{$modelName}");
+        $config['eloquent_model'] = $eloquentModel;
+        
+        // Preguntar por la tabla
+        $tableName = $this->ask("Nombre de la tabla", Str::snake(Str::pluralStudly($modelName)));
+        $config['table'] = $tableName;
+        
+        // Preguntar por campos de dominio
+        $domainFields = $this->ask("Campos de dominio (separados por coma)", "id,name");
+        $config['domain_fields'] = array_map('trim', explode(',', $domainFields));
+        
+        // Campos a excluir de extras
+        $excludeFields = $this->ask("Campos a excluir de extras (separados por coma)", "created_at,updated_at,deleted_at");
+        $config['exclude_from_extra'] = array_map('trim', explode(',', $excludeFields));
+        
+        // Configuración de relaciones
+        if ($this->confirm("¿Desea configurar relaciones para este modelo?", true)) {
+            $config['relationships'] = $this->configureRelationshipsInteractively($modelName);
+        }
+        
+        return $config;
+    }
+    
+    /**
+     * Configura las relaciones de un modelo interactivamente.
+     */
+    protected function configureRelationshipsInteractively(string $modelName): array
+    {
+        $relationships = [];
+        $relationTypes = ['hasOne', 'hasMany', 'belongsTo', 'belongsToMany', 'morphOne', 'morphMany', 'morphTo', 'morphToMany'];
+        
+        do {
+            $relationType = $this->choice("Tipo de relación a agregar", $relationTypes);
+            $relationName = $this->ask("Nombre de la relación (ej: posts)");
+            
+            $relation = [
+                'model' => $this->ask("Modelo relacionado", Str::singular(Str::studly($relationName)))
+            ];
+            
+            // Configurar parámetros según el tipo de relación
+            if (in_array($relationType, ['hasOne', 'hasMany'])) {
+                $relation['foreign_key'] = $this->ask("Llave foránea", strtolower($modelName).'_id');
+                $relation['local_key'] = $this->ask("Llave local", 'id');
+            } elseif ($relationType === 'belongsTo') {
+                $relation['foreign_key'] = $this->ask("Llave foránea", strtolower(Str::singular($relationName)).'_id');
+                $relation['owner_key'] = $this->ask("Llave propietaria", 'id');
+            } elseif ($relationType === 'belongsToMany') {
+                $relation['table'] = $this->ask("Tabla pivote", 
+                    Str::snake(collect([Str::singular($modelName), Str::singular($relation['model'])])
+                        ->sort()->join('_')));
+                $relation['foreign_pivot_key'] = $this->ask("Llave foránea pivote", strtolower($modelName).'_id');
+                $relation['related_pivot_key'] = $this->ask("Llave relacionada pivote", strtolower(Str::singular($relationName)).'_id');
+            } elseif (in_array($relationType, ['morphOne', 'morphMany', 'morphToMany'])) {
+                $relation['relation_name'] = $this->ask("Nombre de relación morph", strtolower($modelName).'able');
+                if ($relationType === 'morphToMany') {
+                    $relation['table'] = $this->ask("Tabla pivote", strtolower($relation['model']).'ables');
+                    $relation['relation_type_column'] = $this->ask("Columna de tipo", strtolower($modelName).'able_type');
+                    $relation['foreign_pivot_key'] = $this->ask("Llave foránea pivote", strtolower($modelName).'able_id');
+                    $relation['related_pivot_key'] = $this->ask("Llave relacionada pivote", strtolower(Str::singular($relationName)).'_id');
+                }
+            }
+            
+            // Agregar la relación configurada
+            if (!isset($relationships[$relationType])) {
+                $relationships[$relationType] = [];
+            }
+            $relationships[$relationType][$relationName] = $relation;
+            
+        } while ($this->confirm("¿Desea agregar otra relación?", false));
+        
+        return $relationships;
+    }
+    
+    protected function createDirectories(): void
+    {
+        $basePath = base_path();
+        
+        // Crear directorios para Domain
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.domain.entities'));
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.domain.value_objects'));
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.domain.exceptions'));
+        
+        // Crear directorios para Application
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.application.ports') . '/Inbound');
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.application.ports') . '/Outbound');
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.application.use_cases'));
+        
+        // Crear directorios para Infrastructure
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.infrastructure.adapters') . '/Database');
+        $this->createDirectory($basePath . '/' . config('hexagonal.paths.infrastructure.controllers'));
+    }
+    
+    protected function createDirectory(string $directory): void
+    {
+        if (!File::exists($directory)) {
+            File::makeDirectory($directory, 0755, true);
+            $this->line("Directorio creado: {$directory}");
+        }
+    }
+
+    protected function generateDomainFiles(string $modelName, array $config): void
+    {
+        // Generar entidad de dominio
+        $entityContent = $this->generateEntityClass($modelName, $config['domain_fields']);
+        $entityPath = base_path() . '/' . config('hexagonal.paths.domain.entities') . "/{$modelName}.php";
+        
+        if (File::exists($entityPath) && !$this->forceOverwrite) {
+            if (!$this->confirm("El archivo {$entityPath} ya existe. ¿Desea sobrescribirlo?", false)) {
+                $this->line("<fg=yellow>Omitiendo creación de entidad: {$entityPath}</>");
+                return;
+            }
+        }
+        
+        File::put($entityPath, $entityContent);
+        $this->line("Creada entidad de dominio: {$entityPath}");
+        
+        // Generar objeto de valor
+        $voContent = $this->generateValueObjectClass($modelName);
+        $voPath = base_path() . '/' . config('hexagonal.paths.domain.value_objects') . "/Additional{$modelName}Info.php";
+        
+        if (File::exists($voPath) && !$this->forceOverwrite) {
+            if (!$this->confirm("El archivo {$voPath} ya existe. ¿Desea sobrescribirlo?", false)) {
+                $this->line("<fg=yellow>Omitiendo creación de objeto de valor: {$voPath}</>");
+                return;
+            }
+        }
+        
+        File::put($voPath, $voContent);
+        $this->line("Creado objeto de valor: {$voPath}");
+        
+        // Generar excepciones
+        $this->generateExceptions($modelName);
+        
+        // Si hay relaciones, generar las entidades relacionadas bajo demanda
+        if (isset($config['relationships'])) {
+            $this->generateRelatedEntities($modelName, $config['relationships']);
+        }
+    }
+    
+    protected function generateEntityClass(string $modelName, array $domainFields): string
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        $properties = [];
+        $constructorParams = [];
+        $toArrayFields = [];
+        
+        foreach ($domainFields as $field) {
+            $properties[] = "public ?string \${$field}";
+            $constructorParams[] = "?string \${$field} = null";
+            $toArrayFields[] = "'{$field}' => \$this->{$field}";
+        }
+        
+        // Agregar campos adicionales para relacionados
+        $properties[] = "public readonly array \$relationships";
+        $constructorParams[] = "array \$relationships = []";
+        
+        $properties[] = "public readonly array \$extra";
+        $constructorParams[] = "array \$extra = []";
+        
+        $propertiesStr = implode(",\n        ", $properties);
+        $toArrayFieldsStr = implode(",\n            ", $toArrayFields);
+        $constructorParamsStr = implode(", ", $constructorParams);
+        
+        // Crear métodos para las relaciones si existen
+        $relationshipMethods = $this->generateEntityRelationshipMethods($modelName);
+        
+        return <<<EOT
+<?php
+
+namespace {$namespace};
+
+class {$modelName}
+{
+    public function __construct(
+        {$propertiesStr}
+    ) {
+        // Asignar valores desde el constructor
+        foreach (get_defined_vars() as \$key => \$value) {
+            if (property_exists(\$this, \$key)) {
+                \$this->{\$key} = \$value;
+            }
+        }
+    }
+    
+    /**
+     * Convierte la entidad a un array.
+     */
+    public function toArray(): array
+    {
+        return [
+            {$toArrayFieldsStr},
+            'relationships' => \$this->relationships,
+            'extra' => \$this->extra
+        ];
+    }
+    
+    /**
+     * Crea una instancia desde un array de datos.
+     */
+    public static function fromArray(array \$data): self
+    {
+        \$entity = new self();
+        
+        // Extraer los campos principales
+        foreach (\$data as \$key => \$value) {
+            if (property_exists(\$entity, \$key)) {
+                \$entity->{\$key} = \$value;
+            } else {
+                \$entity->extra[\$key] = \$value;
+            }
+        }
+        
+        return \$entity;
+    }
+    
+{$relationshipMethods}
+}
+
+EOT;
+    }
+    
+    /**
+     * Genera métodos para acceder a las relaciones de una entidad.
+     */
+    protected function generateEntityRelationshipMethods(string $modelName): string
+    {
+        $config = config("hexagonal.models." . strtolower($modelName), []);
+        
+        if (!isset($config['relationships']) || empty($config['relationships'])) {
+            return '';
+        }
+        
+        $methods = [];
+        $entityNamespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        
+        foreach ($config['relationships'] as $relationType => $relations) {
+            foreach ($relations as $relationName => $relation) {
+                $relatedModelName = $relation['model'];
+                
+                // Determinar el tipo de retorno basado en el tipo de relación
+                $returnType = in_array($relationType, ['hasOne', 'belongsTo', 'morphOne', 'morphTo'])
+                    ? "?\\{$entityNamespace}\\{$relatedModelName}"
+                    : "array"; // Para colecciones (hasMany, belongsToMany, etc.)
+                
+                $methodBody = match ($relationType) {
+                    'hasOne', 'belongsTo', 'morphOne', 'morphTo' => "return \$this->relationships['{$relationName}'] ?? null;",
+                    default => "return \$this->relationships['{$relationName}'] ?? [];",
+                };
+                
+                $methods[] = <<<EOT
+    
+    /**
+     * Obtiene la relación "{$relationName}" ({$relationType}).
+     */
+    public function {$relationName}(): {$returnType}
+    {
+        {$methodBody}
+    }
+EOT;
+            }
+        }
+        
+        return implode("\n", $methods);
+    }
+    
+    /**
+     * Genera las entidades relacionadas que no existan.
+     */
+    protected function generateRelatedEntities(string $modelName, array $relationships): void
+    {
+        $relatedModels = [];
+        
+        // Recolectar todos los modelos relacionados
+        foreach ($relationships as $relationType => $relations) {
+            foreach ($relations as $relationConfig) {
+                $relatedModels[] = $relationConfig['model'];
+            }
+        }
+        
+        $relatedModels = array_unique($relatedModels);
+        
+        foreach ($relatedModels as $relatedModel) {
+            // Verificar si la entidad ya existe
+            $entityPath = base_path() . '/' . config('hexagonal.paths.domain.entities') . "/{$relatedModel}.php";
+            
+            if (File::exists($entityPath)) {
+                continue; // La entidad ya existe, no es necesario generarla
+            }
+            
+            // Verificar si el modelo relacionado está configurado
+            if (config()->has("hexagonal.models." . strtolower($relatedModel))) {
+                // El modelo está configurado, se podría generar la entidad completa
+                if ($this->isInteractive && $this->confirm("¿Desea generar la entidad completa para {$relatedModel}?", false)) {
+                    $relatedConfig = config("hexagonal.models." . strtolower($relatedModel));
+                    $this->generateDomainFiles($relatedModel, $relatedConfig);
+                } else {
+                    // Generar una entidad básica
+                    $this->generateBasicEntity($relatedModel);
+                }
+            } else {
+                // El modelo no está configurado, generar una entidad básica
+                $this->generateBasicEntity($relatedModel);
+            }
+        }
+    }
+    
+    /**
+     * Genera una entidad básica para modelos relacionados.
+     */
+    protected function generateBasicEntity(string $modelName): void
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        $entityPath = base_path() . '/' . config('hexagonal.paths.domain.entities') . "/{$modelName}.php";
+        
+        $basicEntityContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+/**
+ * Entidad básica generada para relaciones (puede requerir personalización).
+ */
+class {$modelName}
+{
+    public function __construct(
+        public ?string \$id = null,
+        public ?string \$name = null,
+        public readonly array \$relationships = [],
+        public readonly array \$extra = []
+    ) {}
+    
+    /**
+     * Crea una nueva instancia desde un array de datos.
+     */
+    public static function fromArray(array \$data): self
+    {
+        \$entity = new self();
+        
+        // Extraer los campos principales
+        foreach (\$data as \$key => \$value) {
+            if (property_exists(\$entity, \$key)) {
+                \$entity->{\$key} = \$value;
+            } else {
+                \$entity->extra[\$key] = \$value;
+            }
+        }
+        
+        return \$entity;
+    }
+    
+    /**
+     * Convierte la entidad a un array.
+     */
+    public function toArray(): array
+    {
+        return [
+            'id' => \$this->id,
+            'name' => \$this->name,
+            'relationships' => \$this->relationships,
+            'extra' => \$this->extra
+        ];
+    }
+}
+
+EOT;
+        
+        if (File::exists($entityPath) && !$this->forceOverwrite) {
+            if (!$this->confirm("El archivo {$entityPath} ya existe. ¿Desea sobrescribirlo?", false)) {
+                $this->line("<fg=yellow>Omitiendo creación de entidad básica: {$entityPath}</>");
+                return;
+            }
+        }
+        
+        File::put($entityPath, $basicEntityContent);
+        $this->line("Creada entidad básica para relación: {$entityPath}");
+    }
+    
+    protected function generateApplicationFiles(string $modelName): void
+    {
+        // Generar interfaces de puertos de entrada (inbound)
+        $serviceInterfaceContent = $this->generateServiceInterface($modelName);
+        $serviceInterfacePath = base_path() . '/' . config('hexagonal.paths.application.ports') . "/Inbound/{$modelName}ServiceInterface.php";
+        
+        if (File::exists($serviceInterfacePath) && !$this->forceOverwrite) {
+            if (!$this->confirm("El archivo {$serviceInterfacePath} ya existe. ¿Desea sobrescribirlo?", false)) {
+                $this->line("<fg=yellow>Omitiendo creación de interfaz de servicio: {$serviceInterfacePath}</>");
+            } else {
+                File::put($serviceInterfacePath, $serviceInterfaceContent);
+                $this->line("Creada interfaz de servicio: {$serviceInterfacePath}");
+            }
+        } else {
+            File::put($serviceInterfacePath, $serviceInterfaceContent);
+            $this->line("Creada interfaz de servicio: {$serviceInterfacePath}");
+        }
+        
+        // Generar interfaces de puertos de salida (outbound)
+        $repositoryInterfaceContent = $this->generateRepositoryInterface($modelName);
+        $repositoryInterfacePath = base_path() . '/' . config('hexagonal.paths.application.ports') . "/Outbound/{$modelName}RepositoryInterface.php";
+        
+        if (File::exists($repositoryInterfacePath) && !$this->forceOverwrite) {
+            if (!$this->confirm("El archivo {$repositoryInterfacePath} ya existe. ¿Desea sobrescribirlo?", false)) {
+                $this->line("<fg=yellow>Omitiendo creación de interfaz de repositorio: {$repositoryInterfacePath}</>");
+            } else {
+                File::put($repositoryInterfacePath, $repositoryInterfaceContent);
+                $this->line("Creada interfaz de repositorio: {$repositoryInterfacePath}");
+            }
+        } else {
+            File::put($repositoryInterfacePath, $repositoryInterfaceContent);
+            $this->line("Creada interfaz de repositorio: {$repositoryInterfacePath}");
+        }
+        
+        // Generar casos de uso
+        $this->generateUseCases($modelName);
+    }
+
+    protected function generateUseCases(string $modelName): void
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.application.use_cases'));
+        $inboundPortNamespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Inbound');
+        $outboundPortNamespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Outbound');
+        $entityNamespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        $exceptionNamespace = $this->getNamespace(config('hexagonal.paths.domain.exceptions'));
+        $basePath = base_path() . '/' . config('hexagonal.paths.application.use_cases');
+        
+        // Caso de uso: Crear
+        $createUseCaseContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$inboundPortNamespace}\\{$modelName}ServiceInterface;
+use {$outboundPortNamespace}\\{$modelName}RepositoryInterface;
+use {$entityNamespace}\\{$modelName};
+use {$exceptionNamespace}\\DomainException;
+
+class Create{$modelName} implements {$modelName}ServiceInterface
+{
+    public function __construct(
+        protected {$modelName}RepositoryInterface \$repository
+    ) {}
+
+    public function create(array \$data): {$modelName}
+    {
+        // Validaciones básicas
+        if (empty(\$data)) {
+            throw new DomainException('Datos inválidos para crear {$modelName}');
+        }
+        
+        return \$this->repository->save(\$data);
+    }
+    
+    public function findById(int \$id, array \$relations = []): ?{$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function update(int \$id, array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function delete(int \$id, bool \$softDelete = true): bool
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findAll(array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findByCriteria(array \$criteria, array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+}
+
+EOT;
+
+        // Caso de uso: Actualizar
+        $updateUseCaseContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$inboundPortNamespace}\\{$modelName}ServiceInterface;
+use {$outboundPortNamespace}\\{$modelName}RepositoryInterface;
+use {$entityNamespace}\\{$modelName};
+use {$exceptionNamespace}\\DomainException;
+
+class Update{$modelName} implements {$modelName}ServiceInterface
+{
+    public function __construct(
+        protected {$modelName}RepositoryInterface \$repository
+    ) {}
+    
+    public function create(array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function findById(int \$id, array \$relations = []): ?{$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function update(int \$id, array \$data): {$modelName}
+    {
+        // Validaciones básicas
+        if (empty(\$data)) {
+            throw new DomainException('Datos inválidos para actualizar {$modelName}');
+        }
+        
+        return \$this->repository->update(\$id, \$data);
+    }
+    
+    public function delete(int \$id, bool \$softDelete = true): bool
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findAll(array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findByCriteria(array \$criteria, array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+}
+
+EOT;
+
+        // Caso de uso: Eliminar
+        $deleteUseCaseContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$inboundPortNamespace}\\{$modelName}ServiceInterface;
+use {$outboundPortNamespace}\\{$modelName}RepositoryInterface;
+use {$entityNamespace}\\{$modelName};
+use {$exceptionNamespace}\\DomainException;
+
+class Delete{$modelName} implements {$modelName}ServiceInterface
+{
+    public function __construct(
+        protected {$modelName}RepositoryInterface \$repository
+    ) {}
+
+    public function create(array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function findById(int \$id, array \$relations = []): ?{$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function update(int \$id, array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function delete(int \$id, bool \$softDelete = true): bool
+    {
+        return \$this->repository->delete(\$id, \$softDelete);
+    }
+    
+    public function findAll(array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findByCriteria(array \$criteria, array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+}
+
+EOT;
+
+        // Caso de uso: Buscar por ID
+        $findByIdUseCaseContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$inboundPortNamespace}\\{$modelName}ServiceInterface;
+use {$outboundPortNamespace}\\{$modelName}RepositoryInterface;
+use {$entityNamespace}\\{$modelName};
+use {$exceptionNamespace}\\DomainException;
+
+class FindById{$modelName} implements {$modelName}ServiceInterface
+{
+    public function __construct(
+        protected {$modelName}RepositoryInterface \$repository
+    ) {}
+
+    public function create(array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function findById(int \$id, array \$relations = []): ?{$modelName}
+    {
+        return \$this->repository->findById(\$id, \$relations);
+    }
+
+    public function update(int \$id, array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function delete(int \$id, bool \$softDelete = true): bool
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findAll(array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findByCriteria(array \$criteria, array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+}
+
+EOT;
+
+        // Caso de uso: Listar todos
+        $findAllUseCaseContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$inboundPortNamespace}\\{$modelName}ServiceInterface;
+use {$outboundPortNamespace}\\{$modelName}RepositoryInterface;
+use {$entityNamespace}\\{$modelName};
+use {$exceptionNamespace}\\DomainException;
+
+class FindAll{$modelName}s implements {$modelName}ServiceInterface
+{
+    public function __construct(
+        protected {$modelName}RepositoryInterface \$repository
+    ) {}
+
+    public function create(array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function findById(int \$id, array \$relations = []): ?{$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function update(int \$id, array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function delete(int \$id, bool \$softDelete = true): bool
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findAll(array \$relations = []): array
+    {
+        return \$this->repository->findAll(\$relations);
+    }
+    
+    public function findByCriteria(array \$criteria, array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+}
+
+EOT;
+
+        // Caso de uso: Buscar por criterios
+        $findByCriteriaUseCaseContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$inboundPortNamespace}\\{$modelName}ServiceInterface;
+use {$outboundPortNamespace}\\{$modelName}RepositoryInterface;
+use {$entityNamespace}\\{$modelName};
+use {$exceptionNamespace}\\DomainException;
+
+class FindByCriteria{$modelName}s implements {$modelName}ServiceInterface
+{
+    public function __construct(
+        protected {$modelName}RepositoryInterface \$repository
+    ) {}
+
+    public function create(array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function findById(int \$id, array \$relations = []): ?{$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function update(int \$id, array \$data): {$modelName}
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+
+    public function delete(int \$id, bool \$softDelete = true): bool
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findAll(array \$relations = []): array
+    {
+        throw new DomainException('Método no implementado en este caso de uso');
+    }
+    
+    public function findByCriteria(array \$criteria, array \$relations = []): array
+    {
+        return \$this->repository->findByCriteria(\$criteria, \$relations);
+    }
+}
+
+EOT;
+
+        // Guardar casos de uso individuales
+        $useCases = [
+            "Create{$modelName}.php" => $createUseCaseContent,
+            "Update{$modelName}.php" => $updateUseCaseContent,
+            "Delete{$modelName}.php" => $deleteUseCaseContent,
+            "FindById{$modelName}.php" => $findByIdUseCaseContent,
+            "FindAll{$modelName}s.php" => $findAllUseCaseContent,
+            "FindByCriteria{$modelName}s.php" => $findByCriteriaUseCaseContent,
+        ];
+        
+        foreach ($useCases as $filename => $content) {
+            $filePath = "{$basePath}/{$filename}";
+            
+            if (File::exists($filePath) && !$this->forceOverwrite) {
+                if (!$this->confirm("El archivo {$filePath} ya existe. ¿Desea sobrescribirlo?", false)) {
+                    $this->line("<fg=yellow>Omitiendo creación de caso de uso: {$filePath}</>");
+                    continue;
+                }
+            }
+            
+            File::put($filePath, $content);
+            $this->line("Creado caso de uso: {$filePath}");
+        }
+    }
+
+    protected function generateProviderClass(string $modelName): string
+    {
+        $inboundPortNamespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Inbound');
+        $outboundPortNamespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Outbound');
+        $useCasesNamespace = $this->getNamespace(config('hexagonal.paths.application.use_cases'));
+        $repositoryNamespace = $this->getNamespace(config('hexagonal.paths.infrastructure.adapters') . '/Database');
+        
+        return <<<EOT
+<?php
+
+namespace App\\Providers;
+
+use Illuminate\\Support\\ServiceProvider;
+use {$inboundPortNamespace}\\{$modelName}ServiceInterface;
+use {$outboundPortNamespace}\\{$modelName}RepositoryInterface;
+use {$repositoryNamespace}\\Eloquent{$modelName}Repository;
+
+class {$modelName}HexagonalServiceProvider extends ServiceProvider
+{
+    /**
+     * Registrar servicios de la arquitectura hexagonal.
+     */
+    public function register(): void
+    {
+        // Registrar adaptadores (repositorios)
+        \$this->app->bind(
+            {$modelName}RepositoryInterface::class,
+            Eloquent{$modelName}Repository::class
+        );
+        
+        // Registrar servicios/casos de uso
+        \$this->registerUseCases();
+    }
+    
+    /**
+     * Registrar los casos de uso con resolución contextual.
+     */
+    protected function registerUseCases(): void
+    {
+        // Caso de uso para crear
+        \$this->app->when(\\{$useCasesNamespace}\\Create{$modelName}::class)
+            ->needs({$modelName}ServiceInterface::class)
+            ->give(function (\$app) {
+                return \$app->make(\\{$useCasesNamespace}\\Create{$modelName}::class);
+            });
+
+        // Caso de uso para actualizar
+        \$this->app->when(\\{$useCasesNamespace}\\Update{$modelName}::class)
+            ->needs({$modelName}ServiceInterface::class)
+            ->give(function (\$app) {
+                return \$app->make(\\{$useCasesNamespace}\\Update{$modelName}::class);
+            });
+
+        // Caso de uso para eliminar
+        \$this->app->when(\\{$useCasesNamespace}\\Delete{$modelName}::class)
+            ->needs({$modelName}ServiceInterface::class)
+            ->give(function (\$app) {
+                return \$app->make(\\{$useCasesNamespace}\\Delete{$modelName}::class);
+            });
+
+        // Caso de uso para buscar por ID
+        \$this->app->when(\\{$useCasesNamespace}\\FindById{$modelName}::class)
+            ->needs({$modelName}ServiceInterface::class)
+            ->give(function (\$app) {
+                return \$app->make(\\{$useCasesNamespace}\\FindById{$modelName}::class);
+            });
+
+        // Caso de uso para listar todos
+        \$this->app->when(\\{$useCasesNamespace}\\FindAll{$modelName}s::class)
+            ->needs({$modelName}ServiceInterface::class)
+            ->give(function (\$app) {
+                return \$app->make(\\{$useCasesNamespace}\\FindAll{$modelName}s::class);
+            });
+
+        // Caso de uso para buscar por criterios
+        \$this->app->when(\\{$useCasesNamespace}\\FindByCriteria{$modelName}s::class)
+            ->needs({$modelName}ServiceInterface::class)
+            ->give(function (\$app) {
+                return \$app->make(\\{$useCasesNamespace}\\FindByCriteria{$modelName}s::class);
+            });
+    }
+    
+    /**
+     * Bootstrap services.
+     */
+    public function boot(): void
+    {
+        // Rutas, middlewares, etc.
+    }
+}
+
+EOT;
+    }
+    
+    protected function generateValueObjectClass(string $modelName): string
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.domain.value_objects'));
+        
+        return <<<EOT
+<?php
+
+namespace {$namespace};
+
+readonly class Additional{$modelName}Info
+{
+    public function __construct(
+        public array \$fields
+    ) {}
+    
+    /**
+     * Crea una nueva instancia desde un array de datos.
+     */
+    public static function fromArray(array \$data): self
+    {
+        return new self(\$data);
+    }
+    
+    /**
+     * Convierte el objeto de valor a un array.
+     */
+    public function toArray(): array
+    {
+        return \$this->fields;
+    }
+}
+
+EOT;
+    }
+    
+    protected function generateExceptions(string $modelName): void
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.domain.exceptions'));
+        $basePath = base_path() . '/' . config('hexagonal.paths.domain.exceptions');
+        
+        // Excepción base de dominio
+        $baseExceptionContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+use Exception;
+
+class DomainException extends Exception
+{
+    public function __construct(string \$message = "Error de dominio", int \$code = 0, ?\Throwable \$previous = null)
+    {
+        parent::__construct(\$message, \$code, \$previous);
+    }
+}
+
+EOT;
+        
+        // Excepción de modelo no encontrado
+        $notFoundExceptionContent = <<<EOT
+<?php
+
+namespace {$namespace};
+
+class {$modelName}NotFoundException extends DomainException
+{
+    public function __construct(string \$message = '{$modelName} no encontrado', int \$code = 404, ?\Throwable \$previous = null)
+    {
+        parent::__construct(\$message, \$code, \$previous);
+    }
+}
+
+EOT;
+
+        if (File::exists("{$basePath}/DomainException.php") && !$this->forceOverwrite) {
+            if (!$this->confirm("El archivo {$basePath}/DomainException.php ya existe. ¿Desea sobrescribirlo?", false)) {
+                $this->line("<fg=yellow>Omitiendo creación de excepción base</>");
+            } else {
+                File::put("{$basePath}/DomainException.php", $baseExceptionContent);
+                $this->line("Creada excepción base: {$basePath}/DomainException.php");
+            }
+        } else {
+            File::put("{$basePath}/DomainException.php", $baseExceptionContent);
+            $this->line("Creada excepción base: {$basePath}/DomainException.php");
+        }
+        
+        $notFoundPath = "{$basePath}/{$modelName}NotFoundException.php";
+        if (File::exists($notFoundPath) && !$this->forceOverwrite) {
+            if (!$this->confirm("El archivo {$notFoundPath} ya existe. ¿Desea sobrescribirlo?", false)) {
+                $this->line("<fg=yellow>Omitiendo creación de excepción de no encontrado</>");
+                return;
+            }
+        }
+        
+        File::put($notFoundPath, $notFoundExceptionContent);
+        $this->line("Creada excepción de no encontrado: {$notFoundPath}");
+    }
+    
+    protected function generateRepositoryInterface(string $modelName): string
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Outbound');
+        $entityNamespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        
+        return <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$entityNamespace}\\{$modelName};
+
+interface {$modelName}RepositoryInterface
+{
+    /**
+     * Guarda una entidad {$modelName}.
+     */
+    public function save(array \$data): {$modelName};
+    
+    /**
+     * Encuentra una entidad {$modelName} por su ID.
+     */
+    public function findById(int \$id, array \$relations = []): ?{$modelName};
+    
+    /**
+     * Actualiza una entidad {$modelName} existente.
+     */
+    public function update(int \$id, array \$data): {$modelName};
+    
+    /**
+     * Elimina una entidad {$modelName}.
+     * @param bool \$softDelete Si es true, realiza un soft delete.
+     */
+    public function delete(int \$id, bool \$softDelete = true): bool;
+    
+    /**
+     * Recupera todas las entidades {$modelName}.
+     */
+    public function findAll(array \$relations = []): array;
+    
+    /**
+     * Busca entidades {$modelName} que cumplan con los criterios especificados.
+     */
+    public function findByCriteria(array \$criteria, array \$relations = []): array;
+}
+
+EOT;
+    }
+    
+    protected function generateRepositoryAdapter(string $modelName, array $config): string
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.infrastructure.adapters') . '/Database');
+        $interfaceNamespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Outbound');
+        $entityNamespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        $exceptionNamespace = $this->getNamespace(config('hexagonal.paths.domain.exceptions'));
+        $eloquentModel = $config['eloquent_model'];
+        $excludeFields = var_export($config['exclude_from_extra'] ?? ['created_at', 'updated_at', 'deleted_at'], true);
+        
+        // Generar código para cargar relaciones
+        $loadRelationsCode = $this->generateLoadRelationsCode($modelName, $config);
+        
+        return <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$interfaceNamespace}\\{$modelName}RepositoryInterface;
+use {$entityNamespace}\\{$modelName};
+use {$exceptionNamespace}\\{$modelName}NotFoundException;
+use {$eloquentModel};
+
+class Eloquent{$modelName}Repository implements {$modelName}RepositoryInterface
+{
+    protected array \$excludeFromExtra = {$excludeFields};
+    
+    public function save(array \$data): {$modelName}
+    {
+        \$model = new User();
+        \$model->fill(\$data);
+        \$model->save();
+        
+        return \$this->mapToEntity(\$model);
+    }
+    
+    public function findById(int \$id, array \$relations = []): ?{$modelName}
+    {
+        \$model = User::with(\$relations)->find(\$id);
+        
+        if (!\$model) {
+            throw new {$modelName}NotFoundException();
+        }
+        
+        return \$this->mapToEntity(\$model);
+    }
+    
+    public function update(int \$id, array \$data): {$modelName}
+    {
+        \$model = User::find(\$id);
+        
+        if (!\$model) {
+            throw new {$modelName}NotFoundException();
+        }
+        
+        \$model->fill(\$data);
+        \$model->save();
+        
+        return \$this->mapToEntity(\$model);
+    }
+    
+    public function delete(int \$id, bool \$softDelete = true): bool
+    {
+        \$model = User::find(\$id);
+        
+        if (!\$model) {
+            throw new {$modelName}NotFoundException();
+        }
+        
+        if (\$softDelete) {
+            return \$model->delete();
+        }
+        
+        return \$model->forceDelete();
+    }
+    
+    public function findAll(array \$relations = []): array
+    {
+        \$models = User::with(\$relations)->get();
+        
+        return \$models->map(function (\$model) {
+            return \$this->mapToEntity(\$model);
+        })->toArray();
+    }
+    
+    public function findByCriteria(array \$criteria, array \$relations = []): array
+    {
+        \$query = User::query();
+        
+        foreach (\$criteria as \$field => \$value) {
+            \$query->where(\$field, \$value);
+        }
+        
+        \$models = \$query->with(\$relations)->get();
+        
+        return \$models->map(function (\$model) {
+            return \$this->mapToEntity(\$model);
+        })->toArray();
+    }
+    
+    /**
+     * Mapea un modelo Eloquent a una entidad de dominio.
+     */
+    protected function mapToEntity(\$model): {$modelName}
+    {
+        // Extraer campos principales
+        \$domainData = [];
+        
+        // Obtener los atributos del modelo
+        \$attributes = \$model->attributesToArray();
+        
+        // Mapear campos del dominio
+        foreach (\$attributes as \$key => \$value) {
+            \$domainData[\$key] = \$value;
+        }
+        
+        // Preparar campos extra
+        \$extraFields = [];
+        foreach (\$attributes as \$key => \$value) {
+            if (!isset(\$domainData[\$key]) && !in_array(\$key, \$this->excludeFromExtra)) {
+                \$extraFields[\$key] = \$value;
+            }
+        }
+        
+        // Cargar relaciones
+        \$relationships = [];
+{$loadRelationsCode}
+        
+        // Crear entidad
+        \$entity = new {$modelName}();
+        
+        // Asignar valores a la entidad
+        foreach (\$domainData as \$key => \$value) {
+            if (property_exists(\$entity, \$key)) {
+                \$entity->{\$key} = \$value;
+            }
+        }
+        
+        // Asignar relaciones y extras
+        \$entity->relationships = \$relationships;
+        \$entity->extra = \$extraFields;
+        
+        return \$entity;
+    }
+}
+
+EOT;
+    }
+    
+    /**
+     * Genera el código para cargar relaciones desde el modelo Eloquent.
+     */
+    protected function generateLoadRelationsCode(string $modelName, array $config): string
+    {
+        if (!isset($config['relationships']) || empty($config['relationships'])) {
+            return "        // No hay relaciones configuradas";
+        }
+        
+        $entityNamespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        $loadCode = [];
+        
+        foreach ($config['relationships'] as $relationType => $relations) {
+            foreach ($relations as $relationName => $relation) {
+                $relatedModelName = $relation['model'];
+                
+                if (in_array($relationType, ['hasOne', 'belongsTo', 'morphOne', 'morphTo'])) {
+                    // Relaciones uno a uno
+                    $loadCode[] = <<<EOT
+        // Cargar relación {$relationName} ({$relationType})
+        if (\$model->{$relationName} && \$model->relationLoaded('{$relationName}')) {
+            \$related = \$model->{$relationName};
+            \$relationships['{$relationName}'] = new \\{$entityNamespace}\\{$relatedModelName}(
+                id: \$related->id,
+                name: \$related->name ?? '',
+                extra: \$this->getExtraFieldsFromModel(\$related)
+            );
+        }
+EOT;
+                } else {
+                    // Relaciones uno a muchos o muchos a muchos
+                    $loadCode[] = <<<EOT
+        // Cargar relación {$relationName} ({$relationType})
+        if (\$model->relationLoaded('{$relationName}')) {
+            \$relationships['{$relationName}'] = [];
+            foreach (\$model->{$relationName} as \$related) {
+                \$relationships['{$relationName}'][] = new \\{$entityNamespace}\\{$relatedModelName}(
+                    id: \$related->id,
+                    name: \$related->name ?? '',
+                    extra: \$this->getExtraFieldsFromModel(\$related)
+                );
+            }
+        }
+EOT;
+                }
+            }
+        }
+        
+        // Agregar método auxiliar para extraer campos extra
+        $loadCode[] = <<<EOT
+        
+        /**
+         * Método auxiliar para extraer campos extra de un modelo relacionado
+         */
+        protected function getExtraFieldsFromModel(\$model): array
+        {
+            \$extraFields = [];
+            \$attributes = \$model->attributesToArray();
+            
+            foreach (\$attributes as \$key => \$value) {
+                if (!\$this->isExcludedField(\$key)) {
+                    \$extraFields[\$key] = \$value;
+                }
+            }
+            
+            return \$extraFields;
+        }
+        
+        /**
+         * Verifica si un campo debe ser excluido de los campos extra
+         */
+        protected function isExcludedField(string \$field): bool
+        {
+            return in_array(\$field, \$this->excludeFromExtra);
+        }
+EOT;
+        
+        return implode("\n\n", $loadCode);
+    }
+}
+
+protected function generateInfrastructureFiles(string $modelName, array $config): void
+{
+    // Generar adaptador de repositorio
+    $repositoryContent = $this->generateRepositoryAdapter($modelName, $config);
+    $repositoryPath = base_path() . '/' . config('hexagonal.paths.infrastructure.adapters') . "/Database/Eloquent{$modelName}Repository.php";
+    
+    if (File::exists($repositoryPath) && !$this->forceOverwrite) {
+        if (!$this->confirm("El archivo {$repositoryPath} ya existe. ¿Desea sobrescribirlo?", false)) {
+            $this->line("<fg=yellow>Omitiendo creación de repositorio: {$repositoryPath}</>");
+        } else {
+            File::put($repositoryPath, $repositoryContent);
+            $this->line("Creado repositorio de infraestructura: {$repositoryPath}");
+        }
+    } else {
+        File::put($repositoryPath, $repositoryContent);
+        $this->line("Creado repositorio de infraestructura: {$repositoryPath}");
+    }
+    
+    // Generar controlador
+    $controllerContent = $this->generateControllerClass($modelName);
+    $controllerPath = base_path() . '/' . config('hexagonal.paths.infrastructure.controllers') . "/{$modelName}Controller.php";
+    
+    if (File::exists($controllerPath) && !$this->forceOverwrite) {
+        if (!$this->confirm("El archivo {$controllerPath} ya existe. ¿Desea sobrescribirlo?", false)) {
+            $this->line("<fg=yellow>Omitiendo creación de controlador: {$controllerPath}</>");
+        } else {
+            File::put($controllerPath, $controllerContent);
+            $this->line("Creado controlador: {$controllerPath}");
+        }
+    } else {
+        File::put($controllerPath, $controllerContent);
+        $this->line("Creado controlador: {$controllerPath}");
+    }
+    
+    // Si se especifica en la configuración, crear providers para registrar los componentes
+    if (config('hexagonal.create_providers', true)) {
+        $this->generateServiceProvider($modelName);
+    }
+}
+
+protected function generateServiceProvider(string $modelName): void
+{
+    $providerContent = $this->generateProviderClass($modelName);
+    $providerPath = base_path() . "/app/Providers/{$modelName}HexagonalServiceProvider.php";
+    
+    // Crear directorio si no existe
+    $this->createDirectory(base_path() . "/app/Providers");
+    
+    if (File::exists($providerPath) && !$this->forceOverwrite) {
+        if (!$this->confirm("El archivo {$providerPath} ya existe. ¿Desea sobrescribirlo?", false)) {
+            $this->line("<fg=yellow>Omitiendo creación de proveedor de servicios: {$providerPath}</>");
+            return;
+        }
+    }
+    
+    File::put($providerPath, $providerContent);
+    $this->line("Creado proveedor de servicios: {$providerPath}");
+    
+    $this->info("Recuerda registrar el proveedor en config/app.php: App\\Providers\\{$modelName}HexagonalServiceProvider::class");
+}
+
+protected function generateControllerClass(string $modelName): string
+{
+    $namespace = $this->getNamespace(config('hexagonal.paths.infrastructure.controllers'));
+    $serviceInterfaceNamespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Inbound');
+    
+    return <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$serviceInterfaceNamespace}\\{$modelName}ServiceInterface;
+use Illuminate\\Http\\Request;
+use Illuminate\\Http\\JsonResponse;
+
+class {$modelName}Controller
+{
+    public function __construct(
+        private {$modelName}ServiceInterface \$service
+    ) {}
+    
+    public function store(Request \$request): JsonResponse
+    {
+        try {
+            // Validar datos de entrada
+            \$validated = \$request->validate([
+                // Define aquí tus reglas de validación
+            ]);
+            
+            // Llamar al caso de uso de creación
+            \$entity = \$this->service->create(\$validated);
+            
+            return response()->json([
+                'data' => \$entity->toArray(),
+                'message' => '{$modelName} creado exitosamente'
+            ], 201);
+        } catch (\\Exception \$e) {
+            return response()->json([
+                'error' => \$e->getMessage()
+            ], \$e->getCode() >= 400 && \$e->getCode() < 600 ? \$e->getCode() : 500);
+        }
+    }
+    
+    public function show(int \$id, Request \$request): JsonResponse
+    {
+        try {
+            // Extraer relaciones solicitadas
+            \$relations = \$request->get('relations', []);
+            
+            // Llamar al caso de uso para buscar por ID
+            \$entity = \$this->service->findById(\$id, \$relations);
+            
+            return response()->json([
+                'data' => \$entity->toArray()
+            ]);
+        } catch (\\Exception \$e) {
+            return response()->json([
+                'error' => \$e->getMessage()
+            ], \$e->getCode() >= 400 && \$e->getCode() < 600 ? \$e->getCode() : 500);
+        }
+    }
+    
+    public function index(Request \$request): JsonResponse
+    {
+        try {
+            // Extraer relaciones solicitadas
+            \$relations = \$request->get('relations', []);
+            
+            // Extraer criterios de búsqueda si se proporcionan
+            \$criteria = \$request->get('criteria', []);
+            
+            // Determinar si usar búsqueda por criterios o listar todos
+            if (!empty(\$criteria)) {
+                \$entities = \$this->service->findByCriteria(\$criteria, \$relations);
+            } else {
+                \$entities = \$this->service->findAll(\$relations);
+            }
+            
+            return response()->json([
+                'data' => array_map(fn(\$entity) => \$entity->toArray(), \$entities),
+                'count' => count(\$entities)
+            ]);
+        } catch (\\Exception \$e) {
+            return response()->json([
+                'error' => \$e->getMessage()
+            ], \$e->getCode() >= 400 && \$e->getCode() < 600 ? \$e->getCode() : 500);
+        }
+    }
+    
+    public function update(Request \$request, int \$id): JsonResponse
+    {
+        try {
+            // Validar datos de entrada
+            \$validated = \$request->validate([
+                // Define aquí tus reglas de validación
+            ]);
+            
+            // Llamar al caso de uso de actualización
+            \$entity = \$this->service->update(\$id, \$validated);
+            
+            return response()->json([
+                'data' => \$entity->toArray(),
+                'message' => '{$modelName} actualizado exitosamente'
+            ]);
+        } catch (\\Exception \$e) {
+            return response()->json([
+                'error' => \$e->getMessage()
+            ], \$e->getCode() >= 400 && \$e->getCode() < 600 ? \$e->getCode() : 500);
+        }
+    }
+    
+    public function destroy(int \$id): JsonResponse
+    {
+        try {
+            // Llamar al caso de uso de eliminación
+            \$result = \$this->service->delete(\$id);
+            
+            return response()->json([
+                'success' => \$result,
+                'message' => '{$modelName} eliminado exitosamente'
+            ]);
+        } catch (\\Exception \$e) {
+            return response()->json([
+                'error' => \$e->getMessage()
+            ], \$e->getCode() >= 400 && \$e->getCode() < 600 ? \$e->getCode() : 500);
+        }
+    }
+}
+
+EOT;
+    }
+    
+    protected function generateServiceInterface(string $modelName): string
+    {
+        $namespace = $this->getNamespace(config('hexagonal.paths.application.ports') . '/Inbound');
+        $entityNamespace = $this->getNamespace(config('hexagonal.paths.domain.entities'));
+        
+        return <<<EOT
+<?php
+
+namespace {$namespace};
+
+use {$entityNamespace}\\{$modelName};
+
+interface {$modelName}ServiceInterface
+{
+    /**
+     * Guarda una entidad {$modelName}.
+     */
+    public function create(array \$data): {$modelName};
+    
+    /**
+     * Encuentra una entidad {$modelName} por su ID.
+     */
+    public function findById(int \$id, array \$relations = []): ?{$modelName};
+    
+    /**
+     * Actualiza una entidad {$modelName} existente.
+     */
+    public function update(int \$id, array \$data): {$modelName};
+    
+    /**
+     * Elimina una entidad {$modelName}.
+     * @param bool \$softDelete Si es true, realiza un soft delete.
+     */
+    public function delete(int \$id, bool \$softDelete = true): bool;
+    
+    /**
+     * Recupera todas las entidades {$modelName}.
+     */
+    public function findAll(array \$relations = []): array;
+    
+    /**
+     * Busca entidades {$modelName} que cumplan con los criterios especificados.
+     */
+    public function findByCriteria(array \$criteria, array \$relations = []): array;
+}
+
+EOT;
+    }
+    
+    protected function getNamespace(string $path): string
+    {
+        // Convertir ruta de directorio a namespace
+        $path = str_replace(['/', '.php'], ['\\', ''], $path);
+        
+        // Si el path comienza con app/ o src/, convertirlo a un namespace adecuado
+        if (str_starts_with($path, 'app\\')) {
+            return 'App\\' . substr($path, 4);
+        } elseif (str_starts_with($path, 'src\\')) {
+            $vendorName = config('hexagonal.vendor_name', 'Laymont');
+            $packageName = config('hexagonal.package_name', 'HexagonalArchitecture');
+            return $vendorName . '\\' . $packageName . '\\' . substr($path, 4);
+        }
+        
+        // Si no coincide con ninguno de los anteriores, simplemente convertir a StudlyCase
+        return Str::studly($path);
+    }
+
+}
